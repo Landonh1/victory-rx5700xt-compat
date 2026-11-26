@@ -145,6 +145,14 @@ const FATAL: [i32; 6] = [
     EXCEPTION_BREAKPOINT,
 ];
 
+fn first_chance_reportable(code: i32, location: Option<&str>) -> bool {
+    let ntdll_probe = code == EXCEPTION_ACCESS_VIOLATION
+        && location
+            .and_then(|location| location.split_once('+'))
+            .is_some_and(|(module, _)| module.eq_ignore_ascii_case("ntdll.dll"));
+    FATAL.contains(&code) && !ntdll_probe
+}
+
 /// Console CPUs are Zen 2: titles use AMD-only instructions Intel CPUs
 /// lack. Does their job instead: `clzero` (`0f 01 fc`) zeroes the 64-byte
 /// line at `rax`; `monitorx`/`mwaitx` (`0f 01 fa`/`fb`) are wait hints, so
@@ -401,7 +409,9 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
     // SAFETY: as above.
-    if FATAL.contains(&unsafe { (*(*info).ExceptionRecord).ExceptionCode }) {
+    let record = unsafe { &*(*info).ExceptionRecord };
+    let location = module_of(record.ExceptionAddress as usize);
+    if first_chance_reportable(record.ExceptionCode, location.as_deref()) {
         // SAFETY: as above.
         unsafe { report("first-chance exception", info, false) };
     }
@@ -544,16 +554,16 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         eprint!("{said}");
         text.push_str(&said);
         append_to_log(&text);
-    }
-    #[cfg(feature = "diagnostics")]
-    for (address, len, file) in SAVE.get().into_iter().flatten() {
-        // SAFETY: the caller of `save_on_crash` named readable memory.
-        let bytes = unsafe { std::slice::from_raw_parts(*address as *const u8, *len) };
-        let saved = std::fs::write(file, bytes);
-        eprintln!(
-            "  saved {address:#x}+{len:#x} to {} ({saved:?})",
-            file.display()
-        );
+        #[cfg(feature = "diagnostics")]
+        for (address, len, file) in SAVE.get().into_iter().flatten() {
+            // SAFETY: the caller of `save_on_crash` named readable memory.
+            let bytes = unsafe { std::slice::from_raw_parts(*address as *const u8, *len) };
+            let saved = std::fs::write(file, bytes);
+            eprintln!(
+                "  saved {address:#x}+{len:#x} to {} ({saved:?})",
+                file.display()
+            );
+        }
     }
 }
 
@@ -715,6 +725,22 @@ mod tests {
             .collect();
         let system: Vec<_> = walked[1..].iter().map(|&f| f as usize).collect();
         assert_eq!(ours, system);
+    }
+
+    #[test]
+    fn first_chance_ntdll_probes_are_left_for_the_unhandled_filter() {
+        assert!(!first_chance_reportable(
+            EXCEPTION_ACCESS_VIOLATION,
+            Some("ntdll.dll+0x1ff2a")
+        ));
+        assert!(first_chance_reportable(
+            EXCEPTION_ACCESS_VIOLATION,
+            Some("victory-image-test.dll+0x1234")
+        ));
+        assert!(first_chance_reportable(
+            EXCEPTION_ILLEGAL_INSTRUCTION,
+            Some("ntdll.dll+0x1234")
+        ));
     }
 
     #[test]
