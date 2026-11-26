@@ -33,18 +33,23 @@ For a supported triangle mesh shader:
 3. Order the compute writes before vertex/index reads with D3D12 resource
    transitions or UAV barriers appropriate to the resources and command-list
    sequence.
-4. Run a generated vertex shader that reads the output record for each emitted
-   index and writes the position and vertex output rows expected by the existing
-   pixel shader. Per-primitive output rows need an explicit, tested mapping to
-   each triangle's vertices and interpolation rules.
+4. Run a generated vertex shader with a fixed draw count of three vertices per
+   possible primitive. `SV_VertexID` maps each draw vertex to its workgroup,
+   primitive, and triangle corner. The shader reads the primitive's three
+   generated indices, fetches the selected vertex rows, and writes per-primitive
+   rows for all three corners with the pixel shader's existing signature and
+   flat interpolation. This expansion is required because indexed vertices
+   cannot carry distinct per-primitive attributes when shared by triangles.
 5. Draw through the existing raster, blend, depth, and render-target state.
 
-The output records must preserve vertex rows, primitive rows, packed 10-bit
-indices, the primitive cull bit, and the mesh output limits. Bounds checks must
-reject a shader/dispatch when its worst-case buffers cannot be allocated.
-The current native translator's static output-count lowering is a potential
-reuse point, but its assumptions must be verified before making it the fallback
-contract.
+The initial row ABI is 16 bytes per signature row, with vertex and primitive
+rows stored separately. Each primitive record begins with three 32-bit indices,
+followed by its primitive rows. The fallback must preserve the packed export's
+index and cull semantics when writing those indices. Draw sizing and all byte
+offsets are computed with checked arithmetic; the host must also reject a plan
+when adapter resource limits or allocation fail. A CPU-side checked sizing and
+vertex-ID mapping helper now captures this ABI, but it does not emit shaders or
+select a runtime path.
 
 ## Amplification and indirect work
 
