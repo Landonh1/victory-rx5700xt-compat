@@ -47,9 +47,9 @@ rows stored separately. Each primitive record begins with three 32-bit indices,
 followed by its primitive rows. The fallback must preserve the packed export's
 index and cull semantics when writing those indices. Draw sizing and all byte
 offsets are computed with checked arithmetic; the host must also reject a plan
-when adapter resource limits or allocation fail. A CPU-side checked sizing and
-vertex-ID mapping helper now captures this ABI, but it does not emit shaders or
-select a runtime path.
+when adapter resource limits or allocation fail. A CPU-side helper derives
+signature row counts from translated mesh DXIL and performs checked sizing and
+vertex-ID mapping, but it does not emit shaders or select a runtime path.
 
 ## Amplification and indirect work
 

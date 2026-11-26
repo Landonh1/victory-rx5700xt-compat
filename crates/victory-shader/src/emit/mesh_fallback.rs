@@ -45,24 +45,69 @@ pub struct ExpandedVertex {
 }
 
 impl MeshFallbackPlan {
+    /// Derives signature row counts from an already translated mesh shader.
+    pub fn from_shader(shader: &super::HostShader, dispatch_groups: u32) -> Result<Self, String> {
+        if shader.stage != crate::HwStage::Ms {
+            return Err("software mesh layout requires a mesh shader".into());
+        }
+        let container = crate::dxbc::Container::parse(&shader.dxil)
+            .map_err(|e| format!("invalid translated mesh container: {e}"))?;
+        let rows = |part| -> Result<u32, String> {
+            let Some(part) = container.part(part) else {
+                return Ok(0);
+            };
+            super::signature(part.data)
+                .map_err(|e| format!("invalid mesh output signature: {e}"))?
+                .iter()
+                .filter_map(|e| e.row)
+                .try_fold(0u32, |count, row| {
+                    row.checked_add(1)
+                        .map(|end| count.max(end))
+                        .ok_or_else(|| "mesh signature row count overflow".to_owned())
+                })
+        };
+        let vertex_rows = rows(crate::dxbc::FourCC::OSG1)?;
+        let primitive_rows = rows(crate::dxbc::FourCC::PSG1)?;
+        let psv = container
+            .part(crate::dxbc::FourCC::PSV0)
+            .ok_or_else(|| "translated mesh shader has no mesh state".to_owned())?;
+        if crate::dxbc::u32_at(psv.data, 0).map_err(|e| e.to_string())? < 48 {
+            return Err("translated mesh shader has no runtime mesh state".into());
+        }
+        let max_vertices = u32::from(crate::dxbc::u16_at(psv.data, 16).map_err(|e| e.to_string())?);
+        let max_primitives =
+            u32::from(crate::dxbc::u16_at(psv.data, 18).map_err(|e| e.to_string())?);
+        Self::new(
+            max_vertices,
+            max_primitives,
+            vertex_rows,
+            primitive_rows,
+            dispatch_groups,
+        )
+        .map_err(str::to_owned)
+    }
+
     /// Builds the checked buffer layout for one direct dispatch.
     ///
-    /// Strides are byte sizes of signature rows and must be 16-byte aligned.
-    /// A zero stride is valid for a signature with no user rows. Resource
+    /// Row counts include any gaps in the signature's register numbering.
+    /// A zero row count is valid for a signature with no user rows. Resource
     /// allocation limits remain adapter-specific and are checked by the host.
     pub fn new(
         max_vertices: u32,
         max_primitives: u32,
-        vertex_stride: u32,
-        primitive_stride: u32,
+        vertex_rows: u32,
+        primitive_rows: u32,
         dispatch_groups: u32,
     ) -> Result<Self, &'static str> {
         if max_vertices == 0 || max_primitives == 0 {
             return Err("mesh output limits must be nonzero");
         }
-        if vertex_stride % 16 != 0 || primitive_stride % 16 != 0 {
-            return Err("mesh signature strides must be 16-byte aligned");
-        }
+        let vertex_stride = vertex_rows
+            .checked_mul(16)
+            .ok_or("mesh vertex signature stride overflow")?;
+        let primitive_stride = primitive_rows
+            .checked_mul(16)
+            .ok_or("mesh primitive signature stride overflow")?;
 
         let vertex_bytes_per_group = u64::from(max_vertices)
             .checked_mul(u64::from(vertex_stride))
@@ -158,10 +203,76 @@ impl MeshFallbackPlan {
 #[cfg(test)]
 mod tests {
     use super::MeshFallbackPlan;
+    use crate::HwStage;
+    use crate::emit::HostShader;
+    use crate::emit::container::{self, Psv, SigElement};
+
+    fn signature_element(row: u32) -> SigElement {
+        SigElement {
+            name: "ATTRIBUTE".into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp: 0,
+            row: Some(row),
+            col: 0,
+            cols: 4,
+            usage: 0xf,
+            half: false,
+        }
+    }
+
+    fn translated_mesh(vertex_row: u32, primitive_row: u32) -> HostShader {
+        let outputs = [signature_element(vertex_row)];
+        let prims = [signature_element(primitive_row)];
+        let psv = container::psv(&Psv {
+            stage: 13,
+            flag: true,
+            inputs: &[],
+            outputs: &outputs,
+            prims: &prims,
+            mesh: Some((
+                super::super::shader::Mesh {
+                    max_vertices: 64,
+                    max_primitives: 32,
+                    topology: 2,
+                },
+                0,
+            )),
+            gs: None,
+            bindings: &[],
+            threads: [64, 1, 1],
+            wave_size: None,
+        });
+        let osg = container::signature(&outputs, false);
+        let psg = container::signature(&prims, false);
+        let dxil = container::build(&[
+            (b"OSG1", &osg),
+            (b"PSG1", &psg),
+            (b"PSV0", &psv),
+            (b"DXIL", &[]),
+        ]);
+        HostShader {
+            stage: HwStage::Ms,
+            dxil,
+            user_data: vec![],
+            samplers: vec![],
+            static_samplers: vec![],
+            root_cbvs: vec![],
+            root_srvs: vec![],
+            root_uavs: vec![],
+            memory: false,
+            memory_writes: false,
+            view_addresses: false,
+            heap: false,
+            heap_writes: false,
+            view_marks: false,
+        }
+    }
 
     #[test]
     fn sizes_per_group_and_expands_primitives_in_order() {
-        let plan = MeshFallbackPlan::new(5, 3, 32, 16, 2).unwrap();
+        let plan = MeshFallbackPlan::new(5, 3, 2, 1, 2).unwrap();
         assert_eq!(plan.vertex_bytes_per_group, 160);
         assert_eq!(plan.primitive_bytes_per_group, 3 * 12 + 3 * 16);
         assert_eq!(plan.vertex_buffer_bytes, 320);
@@ -182,12 +293,22 @@ mod tests {
     #[test]
     fn refuses_bad_strides_and_draw_count_overflow() {
         assert_eq!(
-            MeshFallbackPlan::new(4, 2, 12, 16, 1).unwrap_err(),
-            "mesh signature strides must be 16-byte aligned"
+            MeshFallbackPlan::new(4, 2, u32::MAX, 16, 1).unwrap_err(),
+            "mesh vertex signature stride overflow"
         );
         assert_eq!(
             MeshFallbackPlan::new(1, 1_000_000_000, 0, 0, 2).unwrap_err(),
             "expanded mesh draw exceeds the D3D12 vertex-count field"
         );
+    }
+
+    #[test]
+    fn derives_row_aligned_buffers_from_translated_signatures() {
+        let plan = MeshFallbackPlan::from_shader(&translated_mesh(2, 1), 4).unwrap();
+        assert_eq!(plan.max_vertices, 64);
+        assert_eq!(plan.max_primitives, 32);
+        assert_eq!(plan.vertex_bytes_per_group, 64 * 48);
+        assert_eq!(plan.primitive_bytes_per_group, 32 * 12 + 32 * 32);
+        assert_eq!(plan.draw_vertex_count, 32 * 4 * 3);
     }
 }

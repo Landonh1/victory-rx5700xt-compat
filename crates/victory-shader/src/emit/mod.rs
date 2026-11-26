@@ -196,10 +196,10 @@
 //!   console never exports them).
 
 mod bitcode;
-#[cfg(test)]
-mod census_tests;
 #[cfg(all(test, windows))]
 mod bvh_tests;
+#[cfg(test)]
+mod census_tests;
 mod container;
 #[cfg(all(test, windows))]
 mod crosslane_tests;
@@ -238,8 +238,8 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use sampler::StaticSampler;
 pub use shader::{
     HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW, ROOT_CBV_SPACE, SAMPLER_SPACE,
-    USER_DATA_SPACE, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS, VIEW_READS, VIEW_SIGNED, VIEW_STRIDE_BITS,
-    VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
+    USER_DATA_SPACE, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS, VIEW_READS, VIEW_SIGNED,
+    VIEW_STRIDE_BITS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
 };
 
 /// The loop limit without an override: 2^20.
@@ -542,7 +542,7 @@ pub fn emit_with(
 }
 
 /// The rows of an `ISG1`/`OSG1` part.
-fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
+pub(super) fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
     use crate::dxbc::u32_at;
     let count = u32_at(part, 0)? as usize;
     let base = u32_at(part, 4)? as usize;
