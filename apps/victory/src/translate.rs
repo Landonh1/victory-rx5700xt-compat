@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use anyhow::Result;
 use victory_shader::emit::host::{self, Host};
 use victory_shader::emit::{self, validator::Validator};
+use victory_shader::native::{MeshIo, StageIo};
 use victory_shader::structure::{self, Atom, LaneExit};
 use victory_shader::{
     Container, FourCC, HwStage, NativeProgram, RootType, ShaderError, ir, native_programs,
@@ -69,11 +70,37 @@ struct Tally {
     ms_emitted: usize,
     ms_validated: usize,
     ms_pipelines: usize,
+    /// Distinct mesh programs found in parsed native containers, including
+    /// those that fail before DXIL emission.
+    ms_discovered: usize,
+    /// Native mesh output shapes: threads, limits, topology, LDS, and
+    /// per-vertex/per-primitive attribute counts.
+    mesh_shapes: BTreeMap<MeshShape, usize>,
+    /// Mesh-stage failure reasons. A shader can contribute more than one
+    /// reason when independent analysis stages reject it.
+    mesh_failed: BTreeMap<String, usize>,
     /// Reason → programs stopped by it, and the first one.
     failed: BTreeMap<String, (usize, String)>,
     /// With `--list`: one line per program and outcome.
     list: bool,
     lines: Vec<String>,
+}
+
+/// Mesh shader execution limits and output signature row counts.
+type MeshShape = (u32, u32, u32, u8, u32, usize, usize);
+
+fn mesh_shape(mesh: &MeshIo) -> MeshShape {
+    let vertex_rows = mesh.outputs.iter().filter(|o| o.param & 0x80 == 0).count();
+    let primitive_rows = mesh.outputs.len() - vertex_rows;
+    (
+        mesh.threads,
+        mesh.max_vertices,
+        mesh.max_primitives,
+        mesh.topology,
+        mesh.lds_bytes,
+        vertex_rows,
+        primitive_rows,
+    )
 }
 
 impl Tally {
@@ -88,6 +115,13 @@ impl Tally {
             .entry(reason)
             .or_insert_with(|| (0, example()))
             .0 += 1;
+    }
+
+    fn fail_stage(&mut self, stage: HwStage, reason: String, example: impl FnOnce() -> String) {
+        if stage == HwStage::Ms {
+            *self.mesh_failed.entry(reason.clone()).or_default() += 1;
+        }
+        self.fail(reason, example);
     }
 
     fn merge(&mut self, other: Tally) {
@@ -130,6 +164,13 @@ impl Tally {
         self.ms_emitted += other.ms_emitted;
         self.ms_validated += other.ms_validated;
         self.ms_pipelines += other.ms_pipelines;
+        self.ms_discovered += other.ms_discovered;
+        for (shape, n) in other.mesh_shapes {
+            *self.mesh_shapes.entry(shape).or_default() += n;
+        }
+        for (reason, n) in other.mesh_failed {
+            *self.mesh_failed.entry(reason).or_default() += n;
+        }
         for (k, n) in other.exports {
             *self.exports.entry(k).or_default() += n;
         }
@@ -286,6 +327,23 @@ pub fn run(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
     );
+    println!(
+        "mesh census  {} unique programs discovered; {} emitted as native mesh DXIL",
+        t.ms_discovered, t.ms_emitted
+    );
+    for ((threads, vertices, primitives, topology, lds, vertex_attrs, primitive_attrs), n) in
+        &t.mesh_shapes
+    {
+        println!(
+            "  shape {n:>6}x: threads={threads}, max_vertices={vertices}, max_primitives={primitives}, topology={topology}, LDS={lds} B, vertex_output_rows={vertex_attrs}, primitive_output_rows={primitive_attrs}"
+        );
+    }
+    if !t.mesh_failed.is_empty() {
+        println!("mesh failure reason occurrences (a shader may have multiple):");
+        for (reason, n) in &t.mesh_failed {
+            println!("  {n:>7}  {reason}");
+        }
+    }
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
@@ -508,6 +566,12 @@ fn translate(
     };
     for p in programs {
         t.programs += 1;
+        if p.stage == HwStage::Ms {
+            t.ms_discovered += 1;
+            if let StageIo::Ms(mesh) = &p.io {
+                *t.mesh_shapes.entry(mesh_shape(mesh)).or_default() += 1;
+            }
+        }
         match victory_shader::range::build(&p.patched_code(), p.wave64, p.vgprs) {
             Ok((program, structured)) => {
                 t.translated += 1;
@@ -521,13 +585,15 @@ fn translate(
                         Some(r)
                     }
                     Err(ShaderError::Unsupported { offset, what }) => {
-                        t.fail(format!("resources: {what}"), || {
+                        t.fail_stage(p.stage, format!("resources: {what}"), || {
                             format!("{} {:?} at {offset:#x}", example(), p.stage)
                         });
                         None
                     }
                     Err(e) => {
-                        t.fail(e.to_string(), || format!("{} {:?}", example(), p.stage));
+                        t.fail_stage(p.stage, e.to_string(), || {
+                            format!("{} {:?}", example(), p.stage)
+                        });
                         None
                     }
                 };
@@ -543,11 +609,14 @@ fn translate(
                             }
                             raised = Some(r);
                         }
-                        Err(ShaderError::Unsupported { offset, what }) => t
-                            .fail(format!("I/O: {what}"), || {
+                        Err(ShaderError::Unsupported { offset, what }) => {
+                            t.fail_stage(p.stage, format!("I/O: {what}"), || {
                                 format!("{} {:?} at {offset:#x}", example(), p.stage)
-                            }),
-                        Err(e) => t.fail(e.to_string(), || format!("{} {:?}", example(), p.stage)),
+                            })
+                        }
+                        Err(e) => t.fail_stage(p.stage, e.to_string(), || {
+                            format!("{} {:?}", example(), p.stage)
+                        }),
                     }
                 }
                 let structured = match structured {
@@ -561,7 +630,7 @@ fn translate(
                             ShaderError::Isa { reason, .. } => format!("structure: {reason}"),
                             e => e.to_string(),
                         };
-                        t.fail(reason, || format!("{} {:?}", example(), p.stage));
+                        t.fail_stage(p.stage, reason, || format!("{} {:?}", example(), p.stage));
                         None
                     }
                 };
@@ -574,11 +643,12 @@ fn translate(
                             *counter(t, p.stage, 1) += 1;
                             check(shader, t, checks, label);
                         }
-                        Err(ShaderError::Unsupported { offset, what }) => t
-                            .fail(format!("emit: {what}"), || {
+                        Err(ShaderError::Unsupported { offset, what }) => {
+                            t.fail_stage(p.stage, format!("emit: {what}"), || {
                                 format!("{} at {offset:#x}", label())
-                            }),
-                        Err(e) => t.fail(format!("emit: {e}"), label),
+                            })
+                        }
+                        Err(e) => t.fail_stage(p.stage, format!("emit: {e}"), label),
                     }
                 }
             }
@@ -587,7 +657,7 @@ fn translate(
                     ShaderError::Unsupported { what, .. } => format!("unsupported: {what}"),
                     e => e.to_string(),
                 };
-                t.fail(reason, || format!("{} {:?}", example(), p.stage));
+                t.fail_stage(p.stage, reason, || format!("{} {:?}", example(), p.stage));
             }
         }
     }
@@ -630,7 +700,7 @@ fn check(
                     t.lines.push(format!("{}  pipeline created", label()));
                 }
             }
-            Err(e) => t.fail(format!("pipeline: {e}"), &label),
+            Err(e) => t.fail_stage(shader.stage, format!("pipeline: {e}"), &label),
         }
     }
     let Some(v) = checks.validator.as_mut() else {
@@ -670,7 +740,7 @@ fn check(
                     let _ = std::fs::write(format!("{name}.txt"), format!("{}\n{text}", label()));
                 }
             }
-            t.fail(format!("validator: {first}"), label);
+            t.fail_stage(shader.stage, format!("validator: {first}"), label);
         }
     }
 }
@@ -854,6 +924,56 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn mesh_failures_are_reported_separately() {
+        let mut tally = Tally::default();
+        tally.fail_stage(HwStage::Ms, "emit: example refusal".into(), || {
+            "mesh-a".into()
+        });
+        tally.fail_stage(HwStage::Vs, "vertex refusal".into(), || "vertex-a".into());
+
+        assert_eq!(tally.mesh_failed.get("emit: example refusal"), Some(&1));
+        assert_eq!(tally.mesh_failed.len(), 1);
+        assert_eq!(
+            tally.failed.get("emit: example refusal").map(|v| v.0),
+            Some(1)
+        );
+        assert_eq!(tally.failed.get("vertex refusal").map(|v| v.0), Some(1));
+    }
+
+    #[test]
+    fn mesh_shape_separates_vertex_and_primitive_rows() {
+        use victory_shader::native::{Usage, VsOutput};
+
+        let mesh = MeshIo {
+            outputs: vec![
+                VsOutput {
+                    usage: Usage::Generic,
+                    row: 0,
+                    param: 0,
+                    fp16: false,
+                    pack2: false,
+                },
+                VsOutput {
+                    usage: Usage::Generic,
+                    row: 1,
+                    param: 0x80,
+                    fp16: false,
+                    pack2: false,
+                },
+            ],
+            clip_cntl: 0,
+            threads: 32,
+            max_vertices: 64,
+            max_primitives: 32,
+            topology: 2,
+            lds_bytes: 1024,
+        };
+
+        assert_eq!(mesh_shape(&mesh), (32, 64, 32, 2, 1024, 1, 1));
+    }
     /// Shader dumps are game-derived, so a dump directory in the repo is refused.
     #[test]
     fn emit_dump_inside_repo_is_refused() {
